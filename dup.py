@@ -87,6 +87,10 @@ def partition(groups, partitioner, fail_safe=True):
             k = partitioner(item)
         except Exception as e:
             if fail_safe:
+                logger = logging.getLogger('{}.partition.generate_key'.format(__name__))
+                logger.warning('Exception while generating %s key for %s, generating random key.', partitioner.__name__, item)
+                logger.debug(e)
+
                 from random import random
                 k = random()
                 while k in subgroups.keys():
@@ -108,7 +112,10 @@ def partition(groups, partitioner, fail_safe=True):
             yield g
 
 def by_hash(method):
-    return lambda groups: partition(groups, lambda file: digest(file, method))
+    digest_func = partial(digest, method=method)
+    digest_func.__name__ = method.__name__  # Give partial a name so we can log it pretty if it fails
+
+    return lambda groups: partition(groups, digest_func)
 
 def by_size(groups):
     return partition(groups, os.path.getsize)
@@ -173,13 +180,13 @@ def cleanup(transform, clean_action=None):
             logger.warning('Ignoring cluster %s', original)
 
         if not subset.issubset(original) or len(excluded) < 1:
-            logger.warning('Skipping cluster %s. Not a subset: %s.', original, subset)
+            logger.warning('Skipping cluster %s. Not a subset: %s.', list(original), list(subset))
             return ()
 #            raise CleanupError.not_subset("{} is not a subset of {}".format(subset, original))
 
         for p in excluded:
             if os.path.islink(p) and os.path.realpath(p) in { os.path.realpath(f) for f in subset }:
-                logger.warning('Skipping cluster %s. Cleanup would create a broken link: %s', original, p)
+                logger.warning('Skipping cluster %s. Cleanup of %s would create a broken link: %s', list(original), list(subset), p)
                 return ()
 #                raise CleanupError.broken_link(
 #                    "Removing '{}' would make '{}' a broken link".format(os.path.realpath(p), p)
