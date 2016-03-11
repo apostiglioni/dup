@@ -4,7 +4,7 @@ import argparse
 import logging
 import sys
 
-from dup import find_files, uniques, duplicates, cleanup, keep
+from dup import find_files, duplicates, cleanup, keep
 
 def cleanup_files(where, selected, dry_run=True, strict_walk=True):
     find_files(
@@ -28,7 +28,6 @@ def main():
     args_parser = argparse.ArgumentParser()
     parser = argparse.ArgumentParser()
     parser.add_argument("path", nargs='+', help="Path where to look for duplicates.")
-    parser.add_argument("-u", "--uniques", action="store_true", help="Find unique files.")
     parser.add_argument("-k", "--keep", action="append", required=True, help='Paths to keep.')
     parser.add_argument("-f", "--force", help='Force deletion.')
     parser.add_argument(
