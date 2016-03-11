@@ -7,7 +7,6 @@ from filecmp import cmp
 from functools import partial
 from hashlib import md5
 
-import common
 from colltools import for_each
 
 def all_files(tops, strict_walk=True):
@@ -167,6 +166,11 @@ def cleanup(transform, clean_action=None):
         subset = set(subset)
         original = set(original)
         excluded = original - subset
+
+        logger.debug('processing cluster %s', original)
+
+        if len(subset) == 0:
+            logger.warning('Ignoring cluster %s', original)
 
         if not subset.issubset(original) or len(excluded) < 1:
             logger.warning('Skipping cluster %s. Not a subset: %s.', original, subset)
