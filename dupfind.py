@@ -19,12 +19,6 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("path", nargs='+', help="Path where to look for duplicates")
     parser.add_argument("-u", "--uniques", action="store_true", help="Find unique files")
-    parser.add_argument(
-        "--non-strict",
-        action="store_false",
-        default=True,
-        help="Strict mode. Fails if there are nonreadable entries in the path"
-    )
 #  parser.add_argument(
 #    "-v",
 #    "--verbosity",
@@ -44,10 +38,9 @@ def main():
 
     which = uniques if args.uniques else duplicates
     action = print_uniques if args.uniques else print_duplicates
-    walk_strict = args.non_strict
     where = args.path
 
-    find_files(which, where, action, walk_strict)
+    find_files(which, where, action)
 
 
 if __name__ == "__main__":

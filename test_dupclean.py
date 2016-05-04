@@ -7,17 +7,17 @@ import unittest
 import errno
 import collections
 
-from dup import find_files, uniques, duplicates, cleanup, keep, CleanupError, WalkError
+from dup import find_files, uniques, duplicates, cleanup, exclude, scan_files
 
 from colltools import for_each
 
 logging.basicConfig(level='DEBUG')
-# for handler in logging.root.handlers:
-#     handler.addFilter(logging.Filter('test_dupclean.TestCleanup'))
+#for handler in logging.root.handlers:
+#    handler.addFilter(logging.Filter('test_dupclean.TestDup.test_permissions'))
 
 
 class DataGenerator():
-    def __init__(self, root_path=None, path_prefix='data-generator.', clean_on_exit=True, logger=None):
+    def __init__(self, root_path=None, path_prefix='data-generator.', clean_on_exit=False, logger=None):
         self._path_prefix = path_prefix
         self._clean_on_exit = clean_on_exit
         self._root_path = root_path
@@ -106,7 +106,7 @@ class DataGenerator():
             'Test data will overwrite existing file: {}'.format(abs_dest_fullname)
         )
 
-        shutil.copy(self.abs_path(origin), abs_dest_dirname)
+        shutil.copy(self.abs_path(origin), abs_dest_fullname)
 
         self.logger.debug("{} copied to {}".format(origin, abs_dest_fullname))
 
@@ -119,8 +119,8 @@ class DataGenerator():
         origin_fullname = self.create_file(origin, size)
         l = [origin_fullname]
 
-        for clone_dirname in paths[1:]:
-            clone_fullname = self.copy_file(origin, clone_dirname)
+        for clone_name in paths[1:]:
+            clone_fullname = self.copy_file(origin, clone_name)
             l.append(clone_fullname)
 
         return set(l)
@@ -238,31 +238,56 @@ class TestCleanup(unittest.TestCase):
         title = '==================== {} ===================='.format(test_name)
         logger.debug(title)
 
-        logger.debug('- cluster: %s', cluster())
-        logger.debug('- about to clean: %s', collect_to_remove(cluster()))
-        logger.debug('- expected %s', repr(expected))
+        logger.debug('- to clean cluster: %s', cluster())
+        logger.debug('- selected to clean: %s', collect_to_remove(cluster()))
+        logger.debug('- expected to have been cleaned: %s', repr(expected))
 
         cleaned = set()
         cleanup_func = cleanup(collect_to_remove, clean_action=cleaned.add)
 
-        if type(expected) == CleanupError:
-            try:
-                cleanup_func(cluster())
-                self.fail('CleanupError expected')
-            except CleanupError as e:
-                logger.debug('- exception thrown: %s', e)
-                self.assertEqual(expected.errno, e.errno)
-        else:
-            cleanup_func(cluster())
+        cleanup_func(cluster())
 
-            logger.debug('- cleaned %s', cleaned)
-            self.assertEqual(expected, cleaned)
+        logger.debug('- cleaned %s', cleaned)
+        self.assertEqual(expected, cleaned)
 
         logger.debug(''.join('=' for _ in range(len(title))))
 
 
 class TestDup(unittest.TestCase):
-    def test_happy_path_strict(self):
+    def test_scan_files(self):
+        files = [
+            { 'file': '1/b.data', 'size': 4097 },
+            { 'file': '2/c.data', 'size': 4096 },
+            { 'file': '3/d.data', 'size': 512 },
+            { 'file': '1/e.data', 'size': 4097 },
+            { 'file': '4/x.unreadable', 'size': 2048, 'readable': False },
+            { 'file': '4/xx.unreadable', 'size': 2048, 'readable': False },
+        ]
+        unaccessible = [
+            { 'file': 'unexecutable/a.data', 'size': 10 },
+            { 'file': 'unexecutable/1/a.data', 'size': 10 },
+            { 'file': 'unreadable/a.data', 'size': 10 },
+            { 'file': 'unreadable/1/a.data', 'size': 10 }
+        ]
+
+        test_name = extract_stack()[-1][2]
+        logger = logging.getLogger('{}.{}.{}'.format(self.__module__, self.__class__, test_name))
+        with DataGenerator(root_path='.test-data', path_prefix='{}.'.format(test_name)) as sandbox:
+            sandbox.logger = logger
+
+            sandbox.create_uniques(files)
+            sandbox.create_uniques(unaccessible)
+
+            sandbox.chmod('unreadable', 0o300)
+            sandbox.chmod('unexecutable', 0o600)
+
+            expected = [os.path.join(sandbox.data_path, f['file']) for f in files]
+            found = set(scan_files(sandbox.data_path))
+
+        self.assertEqual(len(set(expected)), len(found))
+        self.assertEqual(set(expected), found)
+
+    def test_happy_path(self):
         duplicates = [
             { 'files': ('1/a.data', '2/a.data', '3/a.data', '4/a.data'), 'size': 4097 },  # 4097 = block size + 1
             { 'files': ('2/aa.data', '4/aa.data'), 'size': 4096 },
@@ -283,9 +308,12 @@ class TestDup(unittest.TestCase):
         def parameters(sandbox):
             return (sandbox.data_path, duplicates, uniques)
 
-        self._run_test(gen_scenario, parameters, strict_walk=False)
+        self._run_test(gen_scenario, parameters)
 
-    def test_happy_path_nonstrict(self):
+    def test_permissions(self):
+        unreadable_duplicates = [
+            { 'files': ('/a.data', '2/a.data', '3/a.data', '4/a.data'), 'size': 4097 },  # 4097 = block size + 1
+        ]
         duplicates = [
             { 'files': ('1/a.data', '2/a.data', '3/a.data', '4/a.data'), 'size': 4097 },  # 4097 = block size + 1
             { 'files': ('2/aa.data', '4/aa.data'), 'size': 4096 },
@@ -298,23 +326,38 @@ class TestDup(unittest.TestCase):
             { 'file': '3/d.data', 'size': 512 },
             { 'file': '1/e.data', 'size': 4097 },
             { 'file': '4/x.data', 'size': 2048, 'readable': False },
-            { 'file': '4/xx.data', 'size': 2048, 'readable': False }
+            { 'file': '4/xx.data', 'size': 2048, 'readable': False },
         ]
-        unreadable_dirs = [
-            { 'files': ('unreadable/1/aaaa.data', 'unreadable/3/aaaa.data'), 'size': 10 }
+        unaccessible_uniques = [
+            { 'file': 'unexecutable/a.data', 'size': 10 }
         ]
-
+        unaccessible_dups = [
+            { 'files': ('unreadable/1/aaaa.data', 'unreadable/3/aaaa.data'), 'size': 10 },
+            { 'files': ('unexecutable/1/aaaa.data', 'unexecutable/3/aaaa.data'), 'size': 10 }
+        ]
+        unreadable_dup = [
+            { 'files': ('1/data.readable', '3/data.unreadable'), 'size': 100 }
+        ]
 
         def gen_scenario(sandbox):
             sandbox.create_uniques(uniques)
+            sandbox.create_uniques(unaccessible_uniques)
             sandbox.create_duplicates(duplicates)
-            sandbox.create_duplicates(unreadable_dirs)
-            sandbox.chmod('unreadable', 0o200)
+            sandbox.create_duplicates(unaccessible_dups)
+            sandbox.create_duplicates(unreadable_dup)
+
+            sandbox.chmod('unreadable', 0o300)
+            sandbox.chmod('unexecutable', 0o600)
+            sandbox.chmod('3/data.unreadable', 0o300)
 
         def parameters(sandbox):
-            return (sandbox.data_path, duplicates, uniques)
+            # Expected uniques = uniques + unreadable duplicate pair
+            expected_uniques = list(uniques)
+            expected_uniques.extend({ 'file': t } for d in unreadable_dup for t in d['files'])
 
-        self._run_test(gen_scenario, parameters, strict_walk=False)
+            return (sandbox.data_path, duplicates, expected_uniques)
+
+        self._run_test(gen_scenario, parameters)
 
     def test_relative_absolute_paths(self):
         duplicates = [
@@ -339,9 +382,7 @@ class TestDup(unittest.TestCase):
         def parameters(sandbox):
             return ((sandbox.data_path, os.path.abspath(sandbox.data_path)), duplicates, uniques)
 
-        # Set root path as a local path so we can set the scan parameters correctly
-        # scenario has been set as non-strict, but condition under test is independent of this fact
-        self._run_test(gen_scenario, parameters, root_path='./.test-data', strict_walk=False)
+        self._run_test(gen_scenario, parameters, root_path='./.test-data')
 
     def test_outside_links(self):
         def gen_scenario(sandbox):
@@ -366,40 +407,31 @@ class TestDup(unittest.TestCase):
 
         self._run_test(gen_scenario, parameters)
 
-    def test_broken_links_strict(self):
-        dups = []
-        uniques = []
-        links = [
-            { 'source': 'a.data',  'dest': 'a.lnk' }
-        ]
 
-        def gen_scenario(sandbox):
-            sandbox.create_uniques(uniques)
-            sandbox.create_duplicates(dups)
-            sandbox.create_links(links)
-
-        def parameters(s):
-            error = WalkError.permission_denied(os.path.join(s.data_path, 'a.lnk'))
-            return (s.data_path, error, error)
-
-        self._run_test(gen_scenario, parameters)
-
-    def test_broken_links_nonstrict(self):
+    def test_broken_links(self):
+        """
+        We don't care whether the links are broken. They are just considered as uniques
+        """
         def gen_scenario(sandbox):
             dups = []
             uniques = []
-            links = [ { 'source': 'a.data',  'dest': 'a.lnk' } ]
+            links = [
+                { 'source': 'a.data', 'dest': 'a.lnk' },
+                { 'source': 'b.data', 'dest': 'a2.lnk' }
+            ]
 
             sandbox.create_uniques(uniques)
             sandbox.create_duplicates(dups)
             sandbox.create_links(links)
 
         def parameters(s):
-            # In nonstrict mode, if file cannot be read (link is broken) we expect it to be counted as a unique
-            uniques = [ { 'file': 'a.lnk', 'size': 1 } ]
+            uniques = [
+                { 'file': 'a.lnk', 'size': 1 },
+                { 'file': 'a2.lnk', 'size': 1 },
+            ]
             return (s.data_path, [], uniques)
 
-        self._run_test(gen_scenario, parameters, strict_walk=False)
+        self._run_test(gen_scenario, parameters)
 
     def test_multiple_inputs(self):
         dups = [
@@ -450,36 +482,6 @@ class TestDup(unittest.TestCase):
 
         self._run_test(gen_scenario, parameters)
 
-    def test_unreadable_dir(self):
-        duplicates = [ { 'files': ('1/aaa.data', '4/aaa.data'), 'size': 1024 } ]
-        uniques = [ { 'file': 'x/x.data', 'size': 10 } ]
-
-        def gen_scenario(sandbox):
-            sandbox.create_uniques(uniques)
-            sandbox.create_duplicates(duplicates)
-            sandbox.chmod('4', 0o300)
-
-        def parameters(sandbox):
-            error = WalkError.permission_denied(os.path.join(sandbox.data_path, '4'))
-            return (sandbox.data_path, error, error)
-
-        self._run_test(gen_scenario, parameters)
-
-    def test_unexecutable_dir(self):
-        duplicates = [ { 'files': ('1/aaa.data', '4/aaa.data'), 'size': 1024 } ]
-        uniques = [ { 'file': 'x/x.data', 'size': 10 } ]
-
-        def gen_scenario(sandbox):
-            sandbox.create_uniques(uniques)
-            sandbox.create_duplicates(duplicates)
-            sandbox.chmod('4', 0o600)
-
-        def parameters(sandbox):
-            error = WalkError.permission_denied(os.path.join(sandbox.data_path, '4'))
-            return (sandbox.data_path, error, error)
-
-        self._run_test(gen_scenario, parameters)
-
     def test_linked_dir(self):
         duplicates = []
         uniques = [ { 'file': '1/nested/a.data', 'size': 10 } ]
@@ -517,17 +519,17 @@ class TestDup(unittest.TestCase):
 
         self._run_test(gen_scenario, parameters)
 
-    def _run_test(self, gen_scenario, parameters, root_path='./.test-data', strict_walk=True):
-        def find(which, where, strict_walk=strict_walk):
+    def _run_test(self, gen_scenario, parameters, root_path='./.test-data'):
+        def find(which, where):
             result = []
-            find_files(which, where, result.append, strict_walk=strict_walk)
+            find_files(which, where, result.append)
 
             return { tuple(cluster) for cluster in result }
 
         def run_safe(what, where):
             try:
                 return find(what, where)
-            except WalkError as e:
+            except e:
                 return e
 
         logger, test_name = _getLogger(self)
@@ -551,15 +553,14 @@ class TestDup(unittest.TestCase):
             result_duplicates = run_safe(duplicates, where)
             result_uniques = run_safe(uniques, where)
 
-            logger.debug('-')
+            logger.debug('---')
             logger.debug('RESULTS:')
-            logger.debug('scanning: {}'.format(where))
-            logger.debug('- strict_walk: {}'.format(strict_walk))
-            logger.debug('- expected uniques: {}'.format(expected_uniques))
-            logger.debug('-    found uniques: {}'.format(result_uniques))
+            logger.debug('scanning: %s', where)
+            logger.debug('- expected uniques: %s', expected_uniques)
+            logger.debug('-    found uniques: %s', result_uniques)
             logger.debug('--')
-            logger.debug('- expected duplicates: {}'.format(expected_dups))
-            logger.debug('-    found duplicates: {}'.format(result_duplicates))
+            logger.debug('- expected duplicates: %s', expected_dups)
+            logger.debug('-    found duplicates: %s', result_duplicates)
 
             _assertEqual(self, expected_dups, result_duplicates)
             _assertEqual(self, expected_uniques, result_uniques)
@@ -604,25 +605,25 @@ class TestKeep(unittest.TestCase):
         cwd = os.path.abspath('.')
         cluster = { 'a', './a', './x/a', '/b', '/x/b', '../b', os.path.join(cwd, 'a') }
         enoent = './not-existing'
-        expected = WalkError.no_such_file([enoent])
+        expected = IOError(errno.ENOENT, 'No such file or directory: {}'.format([enoent]))
 
         self._run_test(cluster, expected, enoent)
 
     def _run_test(self, cluster, expected, *keep_path):
         try:
-            keep_func = keep(*keep_path)
+            keep_func = exclude(*keep_path)
             result = set(keep_func(cluster))
-        except WalkError as e:
+        except IOError as e:
             result = e
 
         logger, test_name = _getLogger(self)
 
         title = '==================== {} ===================='.format(test_name)
         logger.debug(title)
-        logger.debug('           keep_path: {}'.format(keep_path))
-        logger.debug('             cluster: {}'.format(cluster))
-        logger.debug(' expected disposable: {}'.format(expected))
-        logger.debug('   result disposable: {}'.format(result))
+        logger.debug('           keep_path: %s', keep_path)
+        logger.debug('             cluster: %s', cluster)
+        logger.debug(' expected disposable: %s', expected)
+        logger.debug('   result disposable: %s', result)
         logger.debug(''.join('=' for _ in range(len(title))))
 
         _assertEqual(self, expected, result)

@@ -9,34 +9,47 @@ from hashlib import md5
 
 from colltools import for_each
 
-def all_files(tops, strict_walk=True):
-    return [scan_files(tops, strict_walk)]
+def all_files(tops):
+    return [scan_files(tops)]
 
-def scan_files(tops, strict_walk):
+def scan_files(tops):
     """Lists all files in the given directories."""
-    tops = (tops,) if isinstance(tops, str) else tops
+
+    logger = _getLogger('scan_files')
+
+    def verify_access(p, showname = None):
+        if not os.access(p, os.R_OK):
+            logger.warning("Permission denied to read %s", showname or p)
+        elif not os.path.isfile(p) and not os.access(p, os.X_OK):
+            logger.warning("Permission denied to walk through %s", showname or p)
 
     dups = []
+    tops = (tops,) if isinstance(tops, str) else tops
 
     for top in tops:
+        verify_access(top)
+
         if os.path.isfile(top):
             if os.path.realpath(top) not in dups:
                 dups.append(os.path.realpath(top))
                 yield top
         else:
             for cwd, dirnames, filenames in os.walk(top):
-                if strict_walk:
-                    for dir in dirnames:
-                        dir = os.path.join(cwd, dir)
-                        if not os.access(dir, os.R_OK) or not os.access(dir, os.X_OK):
-                            raise WalkError.permission_denied(dir)
+
+                if not os.access(cwd, os.X_OK):
+                    # If dir is unaccessible, files cannot be read and we can't diferentiate between files and dirs.
+                    # We will treat this case as if the dir was unreadable
+                    continue
+
+                for dir in dirnames:
+                    dir = os.path.join(cwd, dir)
+                    verify_access(dir)
 
                 for file in filenames:
                     file = os.path.join(cwd, file)
                     realpath = os.path.realpath(file)
 
-                    if strict_walk and not os.access(realpath, os.R_OK):
-                        raise WalkError.permission_denied(file)
+                    verify_access(realpath, file)
 
                     if realpath not in dups:
                         dups.append(realpath)
@@ -87,7 +100,7 @@ def partition(groups, partitioner, fail_safe=True):
             k = partitioner(item)
         except Exception as e:
             if fail_safe:
-                logger = logging.getLogger('{}.partition.generate_key'.format(__name__))
+                logger = _getLogger('partition')
                 logger.warning('Exception while generating %s key for %s, generating random key.', partitioner.__name__, item)
                 logger.debug(e)
 
@@ -151,25 +164,42 @@ def process_cluster(cluster, transform, validate, action):
         action = action
     )
 
-def find_files(which, where, action, strict_walk=True):
+def find_files(which, where, action):
     for_each(
         which(
             group_by_size_hash_content(
-                all_files(where, strict_walk=strict_walk)
+                all_files(where)
             )
         ),
         action = action
     )
 
-def cleanup(transform, clean_action=None):
-    logger = logging.getLogger('{}.cleanup'.format(__name__))
+def cleanup(selector, clean_action=None):
+    """
+    Returns a cleanup function that receives a cluster of files.
+    The returned function validates that applying the given selector to the to the cluster of files will not cause
+    data loss, and if safe, applies the given clean_action or, if no clean_action is given, a default remove function
+    to the selected items cluster.
+
+    :param selector: A function that takes a cluster of files and returns the subset to clean
+    :param clean_action: The action to execute for each element of the subset to clean
+    """
+
+    logger = _getLogger('cleanup')
 
     def validate_excluded(subset, original):
         """
-        For each cluster in clusters, applies the given predicate.
-        Assumes that predicate returns a subset of the original cluster, and that the items removed are existing files.
-        Should the assumptions be false, an exception is thrown.
+        This function is used to validate that removing the given subset from the original set will not cause
+        data loss.
+        It returns the given subset if valid, or a new empty set if invalid.
+
+        Validates that:
+         * subset is not empty.
+         * subset is a strict subset of original.
+         * each element in the original set but not in the subset (original - subset) is not a link to an element in
+           subset.
         """
+
         subset = set(subset)
         original = set(original)
         excluded = original - subset
@@ -178,30 +208,36 @@ def cleanup(transform, clean_action=None):
 
         if len(subset) == 0:
             logger.warning('Ignoring cluster %s', original)
-
-        if not subset.issubset(original) or len(excluded) < 1:
-            logger.warning('Skipping cluster %s. Not a subset: %s.', list(original), list(subset))
             return ()
-#            raise CleanupError.not_subset("{} is not a subset of {}".format(subset, original))
+
+        if not subset.issubset(original) or original == subset:
+            logger.warning('Skipping cluster %s. Not a strict subset: %s.', list(original), list(subset))
+            return ()
 
         for p in excluded:
             if os.path.islink(p) and os.path.realpath(p) in { os.path.realpath(f) for f in subset }:
                 logger.warning('Skipping cluster %s. Cleanup of %s would create a broken link: %s', list(original), list(subset), p)
                 return ()
-#                raise CleanupError.broken_link(
-#                    "Removing '{}' would make '{}' a broken link".format(os.path.realpath(p), p)
-#                )
 
         return subset
 
-    def remove(a):
-        pass
+    return partial(process_cluster, transform=selector, validate=validate_excluded, action=clean_action or remove)
 
-    return partial(process_cluster, transform=transform, validate=validate_excluded, action=clean_action or remove)
+def remove(a):
+    pass
 
+def exclude(*secured):
+    """
+    Returns a function that receives a cluster of files. The new function returns the files in the cluster that
+    are not secured.
 
-def keep(*secured):
-    def _keep(cluster):
+    A file is considered secured if it's path is not under the tree of those elements passed as arguments to the
+    original function.
+
+    If any of the 'secured' paths does not exist, an exception is thrown.
+    """
+
+    def _exclude(cluster):
         secured_abspaths = [ os.path.abspath(item) for item in secured ]
 
         selected = []
@@ -216,35 +252,10 @@ def keep(*secured):
     unsecured = [ s for s in secured if not os.path.exists(s) ]
 
     if len(unsecured) > 0:
-        raise WalkError.no_such_file(unsecured)
+        raise IOError(errno.ENOENT, 'No such file or directory: {}'.format(unsecured))
 
-    return _keep
+    return _exclude
 
+def _getLogger(name):
+    return logging.getLogger('{}.{}'.format(__name__, name))
 
-class CleanupError(Exception):
-    NOT_SUBSET = 0
-    BROKEN_LINK = 1
-
-    def __init__(self, errno, message):
-        # Call the base class constructor with the parameters it needs
-        super(CleanupError, self).__init__(message)
-
-        self.errno = errno
-
-    @staticmethod
-    def broken_link(message='Broken link'):
-        return CleanupError(CleanupError.BROKEN_LINK, message)
-
-    @staticmethod
-    def not_subset(message='Not subset'):
-        return CleanupError(CleanupError.NOT_SUBSET, message)
-
-
-class WalkError(IOError):
-    @staticmethod
-    def permission_denied(path):
-        return WalkError(errno.EACCES, 'Permission denied: {}'.format(path))
-
-    @staticmethod
-    def no_such_file(path):
-        return WalkError(errno.ENOENT, 'No such file or directory: {}'.format(path))
